@@ -1,0 +1,92 @@
+name: Build and publish Caddy
+on:
+  push:
+    branches: [main]
+    paths:
+      - Dockerfile
+      - .dockerignore
+      - .github/workflows/publish.yml
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build native image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/${{ matrix.arch }}
+          load: true
+          tags: ghcr.io/yuehei/caddy:sha-${{ github.sha }}-${{ matrix.arch }}
+          cache-from: type=gha,scope=caddy-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=caddy-${{ matrix.arch }}
+      - name: Verify version and required modules
+        env:
+          IMAGE: ghcr.io/yuehei/caddy:sha-${{ github.sha }}-${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          expected=$(sed -n 's/^ARG CADDY_VERSION=//p' Dockerfile)
+          version=$(docker run --rm "$IMAGE" caddy version)
+          test "${version%% *}" = "v${expected}"
+          docker run --rm "$IMAGE" caddy list-modules > modules.txt
+          for module in dns.providers.tencentcloud layer4 layer4.handlers.tls layer4.handlers.proxy; do
+            grep -Fx "$module" modules.txt
+          done
+      - name: Publish verified architecture
+        env:
+          IMAGE: ghcr.io/yuehei/caddy:sha-${{ github.sha }}-${{ matrix.arch }}
+        run: docker push "$IMAGE"
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish multi-platform tags
+        env:
+          IMAGE: ghcr.io/yuehei/caddy
+          REVISION: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          version=$(sed -n 's/^ARG CADDY_VERSION=//p' Dockerfile)
+          docker buildx imagetools create \
+            --tag "$IMAGE:latest" \
+            --tag "$IMAGE:$version" \
+            --tag "$IMAGE:sha-$REVISION" \
+            "$IMAGE:sha-$REVISION-amd64" \
+            "$IMAGE:sha-$REVISION-arm64"
+          docker buildx imagetools inspect "$IMAGE:$version"
+          echo "Published $IMAGE:$version (linux/amd64, linux/arm64)" >> "$GITHUB_STEP_SUMMARY"
